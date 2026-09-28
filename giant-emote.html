@@ -1,0 +1,261 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:transparent!important}
+#stage{position:relative;width:100%;height:100%;overflow:hidden;pointer-events:none;background:transparent}
+#visual{position:absolute;left:18%;top:50%;width:560px;height:560px;transform:translate(-50%,-50%);display:flex;align-items:center;justify-content:center;opacity:0;transition:none;animation:none}
+#visual.visible{opacity:1}
+#emote{display:none;max-width:100%;max-height:100%;width:auto;height:auto;object-fit:contain;filter:drop-shadow(0 0 12px rgba(255,255,255,.40));}
+#emoji{display:none;font-family:"Segoe UI Emoji","Apple Color Emoji",sans-serif;font-size:520px;line-height:1;filter:drop-shadow(0 0 12px rgba(255,255,255,.40));}
+</style>
+</head>
+<body>
+<div id="stage"><div id="visual"><img id="emote" alt=""><div id="emoji"></div></div></div>
+<script>
+(() => {
+  const visual = document.getElementById('visual');
+  const emote = document.getElementById('emote');
+  const emoji = document.getElementById('emoji');
+  let hideTimer = null;
+  let displaySeconds = 30;
+  let size = 560;
+  let xPercent = 18;
+  let yPercent = 50;
+  let glow = 12;
+  let widgetBound = false;
+  let koiBound = false;
+  let fallbackStarted = false;
+  let fallbackSocket = null;
+  let fallbackReconnectTimer = null;
+
+  const clamp = (n, min, max, fallback) => {
+    n = Number(n);
+    return Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : fallback;
+  };
+
+  function applySettingsObject(settings = {}) {
+    displaySeconds = clamp(settings['display.display_seconds'], 1, 300, 30);
+    size = clamp(settings['display.size'], 100, 1400, 560);
+    xPercent = clamp(settings['display.x_percent'], 0, 100, 18);
+    yPercent = clamp(settings['display.y_percent'], 0, 100, 50);
+    glow = clamp(settings['display.glow'], 0, 80, 12);
+
+    visual.style.left = xPercent + '%';
+    visual.style.top = yPercent + '%';
+    visual.style.width = size + 'px';
+    visual.style.height = size + 'px';
+    emoji.style.fontSize = Math.max(32, Math.round(size * 0.92)) + 'px';
+    const fx = `drop-shadow(0 0 ${glow}px rgba(255,255,255,.40))`;
+    emote.style.filter = fx;
+    emoji.style.filter = fx;
+  }
+
+  function applySettings() {
+    try {
+      applySettingsObject({
+        'display.display_seconds': Widget.getSetting('display.display_seconds'),
+        'display.size': Widget.getSetting('display.size'),
+        'display.x_percent': Widget.getSetting('display.x_percent'),
+        'display.y_percent': Widget.getSetting('display.y_percent'),
+        'display.glow': Widget.getSetting('display.glow')
+      });
+    } catch (_) {
+      applySettingsObject();
+    }
+  }
+
+  function restartTimer() {
+    clearTimeout(hideTimer);
+    visual.classList.add('visible');
+    hideTimer = setTimeout(() => visual.classList.remove('visible'), displaySeconds * 1000);
+  }
+
+  function showImage(url, name) {
+    if (!url) return;
+    emoji.style.display = 'none';
+    emote.style.display = 'block';
+    emote.alt = name || 'emote';
+    emote.src = url;
+    restartTimer();
+  }
+
+  function showEmoji(text) {
+    if (!text) return;
+    emote.style.display = 'none';
+    emoji.style.display = 'block';
+    emoji.textContent = text;
+    restartTimer();
+  }
+
+  function candidateFromFragment(fragment) {
+    if (!fragment) return null;
+
+    if (fragment.type === 'EMOTE' && fragment.imageLink) {
+      return { kind: 'image', url: fragment.imageLink, name: fragment.name || fragment.raw || 'emote' };
+    }
+
+    if (fragment.type === 'EMOJI') {
+      try {
+        const provider = App.get('emojiProvider');
+        const asset = fragment.variation && fragment.variation.assets && fragment.variation.assets[provider];
+        if (asset && asset.pngUrl) {
+          return { kind: 'image', url: asset.pngUrl, name: fragment.raw || 'emoji' };
+        }
+      } catch (_) {}
+      if (fragment.raw) return { kind: 'text', text: fragment.raw };
+    }
+
+    return null;
+  }
+
+  function handleRichMessage(event) {
+    if (!event || !Array.isArray(event.fragments)) return;
+    let latest = null;
+    for (const fragment of event.fragments) {
+      const c = candidateFromFragment(fragment);
+      if (c) latest = c;
+    }
+    if (!latest) return;
+    if (latest.kind === 'image') showImage(latest.url, latest.name);
+    else showEmoji(latest.text);
+  }
+
+  function bindInjectedApis() {
+    if (!widgetBound) {
+      try {
+        if (typeof Widget !== 'undefined' && Widget && typeof Widget.on === 'function') {
+          Widget.on('update', applySettings);
+          Widget.broadcast('update');
+          widgetBound = true;
+        }
+      } catch (_) {}
+    }
+
+    if (!koiBound && !fallbackStarted) {
+      try {
+        if (typeof Koi !== 'undefined' && Koi && typeof Koi.on === 'function') {
+          Koi.on('rich_message', handleRichMessage);
+          koiBound = true;
+        }
+      } catch (_) {}
+    }
+
+    return widgetBound && koiBound;
+  }
+
+  function startDirectFallback() {
+    if (fallbackStarted) return;
+
+    let params;
+    try {
+      params = new URL(parent.location.href).searchParams;
+    } catch (_) {
+      return;
+    }
+
+    const pluginId = params.get('pluginId');
+    const widgetId = params.get('widgetId');
+    const authorization = params.get('authorization');
+    const address = params.get('validAddress') || parent.location.hostname;
+    const port = params.get('port') || parent.location.port || '8092';
+    const mode = (params.get('mode') || 'WIDGET').toUpperCase();
+    if (!pluginId || !widgetId || !authorization || !address) return;
+
+    fallbackStarted = true;
+
+    function connect() {
+      clearTimeout(fallbackReconnectTimer);
+      const protocol = parent.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const endpoint = `${protocol}//${address}:${port}/api/plugin/${encodeURIComponent(pluginId)}` +
+        `/widget/${encodeURIComponent(widgetId)}/realtime?authorization=${encodeURIComponent(authorization)}` +
+        `&mode=${encodeURIComponent(mode)}`;
+
+      try {
+        fallbackSocket = new WebSocket(endpoint);
+      } catch (_) {
+        fallbackReconnectTimer = setTimeout(connect, 2500);
+        return;
+      }
+
+      const send = (type, data = {}) => {
+        if (fallbackSocket && fallbackSocket.readyState === WebSocket.OPEN) {
+          fallbackSocket.send(JSON.stringify({ type, data }));
+        }
+      };
+
+      fallbackSocket.onmessage = raw => {
+        let payload;
+        try {
+          payload = JSON.parse(raw.data);
+        } catch (_) {
+          return;
+        }
+
+        if (payload.type === 'PING') {
+          send('PONG');
+          return;
+        }
+
+        if (payload.type === 'INIT') {
+          applySettingsObject(payload.data && payload.data.widget && payload.data.widget.settings);
+          send('READY');
+          return;
+        }
+
+        if (payload.type === 'UPDATE') {
+          applySettingsObject(payload.data && payload.data.widget && payload.data.widget.settings);
+          return;
+        }
+
+        if (payload.type === 'KOI') {
+          const event = payload.data;
+          if (event && String(event.event_type || '').toUpperCase() === 'RICH_MESSAGE') {
+            handleRichMessage(event);
+          }
+        }
+      };
+
+      fallbackSocket.onclose = () => {
+        fallbackReconnectTimer = setTimeout(connect, 2500);
+      };
+    }
+
+    connect();
+  }
+
+  // Caffeinated injects Widget/Koi into the child frame. The exact point at
+  // which those globals become visible differs between browser engines, so a
+  // one-shot lookup can miss them permanently. Retry briefly and bind once.
+  // If the loader never injects them (observed in Edge/WebView2), connect to
+  // the same local widget websocket directly as a compatibility fallback.
+  applySettings();
+  if (!bindInjectedApis()) {
+    let attempts = 0;
+    const injectionTimer = setInterval(() => {
+      attempts++;
+      if (bindInjectedApis()) {
+        clearInterval(injectionTimer);
+      } else if (attempts >= 20) {
+        clearInterval(injectionTimer);
+        startDirectFallback();
+      }
+    }, 50);
+  }
+
+  // Optional console test: bLazemGiantEmoteTest()
+  window.bLazemGiantEmoteTest = () => {
+    showEmoji('🔥');
+  };
+  window.bLazemGiantEmoteStatus = () => ({
+    widgetBound,
+    koiBound,
+    fallbackStarted,
+    fallbackSocketState: fallbackSocket ? fallbackSocket.readyState : null
+  });
+})();
+</script>
+</body>
+</html>
